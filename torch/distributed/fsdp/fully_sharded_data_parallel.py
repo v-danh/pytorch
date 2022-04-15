@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import functools
+import itertools
 import traceback
 import warnings
 from contextlib import contextmanager
@@ -238,6 +239,35 @@ class StateDictType(Enum):
 class OptimStateKeyType(Enum):
     PARAM_NAME = auto()
     PARAM_ID = auto()
+
+class _ExecOrderData():
+    """
+    This contains the data used for validating execution order across ranks.
+
+    Attributes:
+        param_to_param_index (Dict[FlatParameter, int]): Mapping from FSDP
+            flattened parameter to a unique parameter index consistent across
+            ranks.
+        is_first_iter (bool): Whether executing in the first iteration or not.
+        param_order (List[int]): Order that parameters participate in the
+            forward pass; constructed on the first iteration and validated
+            against in subsequent iterations.
+        index (int): Index tracking the position in ``param_order``
+            when validating the forward pass execution order in subsequent
+            iterations.
+    """
+    param_to_param_index: Dict[FlatParameter, int] = {}
+    # Modified in the first iteration:
+    is_first_iter: bool = True
+    param_order: List[int] = []
+    # Modified in the subsequent iterations:
+    index: int = 0
+
+    def reset(self):
+        """Called in :meth:`_wait_for_post_backward` to reset data for the next
+        iteration."""
+        self.is_first_iter = False
+        self.index = 0
 
 
 class FullyShardedDataParallel(nn.Module):
@@ -484,6 +514,9 @@ class FullyShardedDataParallel(nn.Module):
             for p in self.params:
                 self._offload_to_cpu(p)
 
+        # For validating execution order across ranks
+        self._exec_order_data = _ExecOrderData()
+
     def _init_reshard_after_forward(self):
         if self.sharding_strategy == ShardingStrategy.FULL_SHARD:
             # Free full params and keep shard only after forward
@@ -628,6 +661,19 @@ class FullyShardedDataParallel(nn.Module):
         while world_size % factor == 0 and world_size / factor > factor:
             factor *= 2
         return float(factor)
+
+    def _get_param_to_param_index(self) -> Dict[FlatParameter, int]:
+        """
+        Returns a mapping from FSDP flattened parameter to a unique index in
+        the FSDP module hierarchy rooted at this module. Critically, this
+        mapping must be consistent across ranks.
+        """
+        assert self._is_root, "Expects to be called only on root FSDP modules"
+        param_to_param_index = {
+            cast(FlatParameter, param): i
+            for i, param in enumerate(self.parameters())
+        }
+        return param_to_param_index
 
     def _offload_to_cpu(self, p):
         """
@@ -1012,6 +1058,7 @@ class FullyShardedDataParallel(nn.Module):
             return
         # No FSDP instance wraps this, else _is_root would be set to False.
         self._is_root = True
+        self._exec_order_data.param_to_param_index = self._get_param_to_param_index()
         # If final backward callback is never been queued, state should be IDLE.
         # If final backward callback is queued, the callback should be finished
         # and the state was reset to be IDLE.
@@ -1052,6 +1099,9 @@ class FullyShardedDataParallel(nn.Module):
             if m is not self and isinstance(m, FullyShardedDataParallel):
                 m._streams = self._streams
                 m._fsdp_graph_order = self._fsdp_graph_order
+                # Give each non-root FSDP module an alias to the root's
+                # execution order data structure
+                m._exec_order_data = self._exec_order_data
 
     def _wait_for_previous_optim_step(self) -> None:
         """
@@ -1951,6 +2001,10 @@ class FullyShardedDataParallel(nn.Module):
             torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
 
         if not self._require_backward_grad_sync:
+            # Reset the execution order data structure here since the
+            # `_wait_for_post_backward()` callback is skipped
+            if self._is_root:
+                self._exec_order_data.reset()
             return
 
         # Wait for all work in the current stream to finish, then start the
@@ -2104,6 +2158,7 @@ class FullyShardedDataParallel(nn.Module):
                 torch.cuda.current_stream().synchronize()
 
         # A backward pass is done, clean up below.
+        self._exec_order_data.reset()
 
         def _finalize_params(fsdp_module: FullyShardedDataParallel) -> None:
             """Helper used below on all fsdp modules."""
@@ -2284,6 +2339,7 @@ class FullyShardedDataParallel(nn.Module):
                         # Allocate based on full size from all shards.
                         _alloc_storage(p._full_param_padded, size=p_full_size)  # type: ignore[attr-defined]
                         output_tensor = p._full_param_padded  # type: ignore[attr-defined]
+                    self._check_all_gather(p)
                     # Fill output_tensor with (p.data for each shard in self.world_size)
                     dist._all_gather_base(
                         output_tensor, p_data, group=self.process_group
@@ -2301,6 +2357,64 @@ class FullyShardedDataParallel(nn.Module):
                     if self.mixed_precision is not None:
                         self._free_mp_shard(cast(List[FlatParameter], [p]))
         return output_tensors
+
+    def _check_all_gather(self, param: FlatParameter):
+        """
+        Checks the validity of an all-gather to rebuild the full parameter
+        ``param``. If on the first iteration, this uses an all-gather to check
+        that all ranks plan to all-gather the same parameter, erroring if not,
+        and on subsequent iterations, this warns the user if the forward pass
+        execution order differs from that of the first iteration, meaning that
+        we can no longer guarantee correct execution.
+
+        Executing in ``no_sync()`` does not affect the execution order check
+        for ``FULL_SHARD`` and ``SHARD_GRAD_OP``: (1) Being in ``no_sync()``
+        in the first iteration does not yield a different all-gather sequence,
+        and (2) being in ``no_sync()`` in a later iteration does not give
+        false positive warnings since the all-gather sequence still matches the
+        first iteration sequence (for ``FULL_SHARD``) or the first iteration
+        sequence's prefix (for ``SHARD_GRAD_OP``).
+        """
+        # Only check all-gathers when rebuilding the full parameters in the
+        # forward pass and in the beginning of the backward pass
+        if self.training_state not in (
+            TrainingState_.FORWARD, TrainingState_.BACKWARD_PRE,
+        ):
+            return
+        eod = self._exec_order_data
+        param_index = eod.param_to_param_index[param]
+        if not eod.is_first_iter:
+            # Warn possibly multiple times for the same iteration since the
+            # number of warnings may be informative in debugging
+            if eod.index >= len(eod.param_order) and self.rank == 0:
+                print("eod.index:", eod.index)
+                print("eod.param_order:", eod.param_order)
+            if param_index != eod.param_order[eod.index]:
+                warnings.warn(
+                    "Execution order differs from that of the first iteration "
+                    f"on rank {self.rank}; collectives are unchecked and may "
+                    "give incorrect results or hang\n"
+                    f"First iter: {eod.param_order}\nThis iter (so far): "
+                    f"{eod.param_order[:eod.index - 1] + [param_index]}"
+                )
+            eod.index += 1
+        else:
+            device = param.device
+            indices = torch.zeros(self.world_size, dtype=torch.int32).to(device)
+            index = torch.tensor([param_index], dtype=torch.int32).to(device)
+            dist._all_gather_base(indices, index, group=self.process_group)
+            # Check that all ranks plan to all-gather the same parameter index
+            for (r1, i1), (r2, i2) in itertools.combinations(
+                ((rank, indices[rank]) for rank in range(self.world_size)), 2,
+            ):
+                if torch.equal(i1, i2):
+                    continue
+                raise RuntimeError(
+                    "Forward pass execution order differs across ranks: rank "
+                    f"{r1} is all-gathering parameter {i1} while rank {r2} "
+                    f"is all-gathering parameter {i2}"
+                )
+            eod.param_order.append(param_index)
 
     @torch.no_grad()
     def _prep_grads_for_backward(self) -> None:
