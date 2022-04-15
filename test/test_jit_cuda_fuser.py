@@ -16,8 +16,9 @@ from torch.testing._internal.codegen.random_topo_test import runDefaultTestWithS
 from torch.testing._internal.common_cuda import TEST_MULTIGPU
 from torch.testing._internal.common_device_type import instantiate_device_type_tests, ops, OpDTypes
 from torch.testing._internal.common_jit import JitCommonTestCase
-from torch.testing._internal.common_methods_invocations import op_db
-from torch.testing._internal.common_utils import run_tests, ProfilingMode, GRAPH_EXECUTOR, TEST_WITH_ROCM, IS_WINDOWS, slowTest
+from torch.testing._internal.common_methods_invocations import op_db, SampleInput
+from torch.testing._internal.common_utils import run_tests, ProfilingMode, GRAPH_EXECUTOR, TEST_WITH_ROCM, IS_WINDOWS, \
+    slowTest, is_iterable_of_tensors
 from torch.testing._internal.jit_utils import clone_inputs, get_traced_sample_variant_pairs, JitTestCase, RUN_CUDA
 from torch.testing._internal.jit_metaprogramming_utils import create_traced_fn
 from torch.testing import FileCheck
@@ -4526,6 +4527,12 @@ class TestCudaFuserOpInfo(JitCommonTestCase):
             self.cuda_fuser_options.restore()
         torch._C._jit_set_nvfuser_single_node_mode(self.nvfuser_single_node_mode)
 
+        # https://github.com/pytorch/pytorch/issues/35600
+        # each torch.jit.trace adds state to the _python_cu compilation unit
+        # since this test traces a lot of functions, out-of-memory can occur
+        # if the CU is not cleared.
+        torch.jit._state._python_cu.drop_all_functions()
+
     @slowTest
     @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
     @ops(op_db, dtypes=OpDTypes.supported)
@@ -4542,11 +4549,52 @@ class TestCudaFuserOpInfo(JitCommonTestCase):
 
             self.assertEqual(ref, val)
 
-        # https://github.com/pytorch/pytorch/issues/35600
-        # each torch.jit.trace adds state to the _python_cu compilation unit
-        # since this test traces a lot of functions, out-of-memory can occur
-        # if the CU is not cleared.
-        torch.jit._state._python_cu.drop_all_functions()
+    @slowTest
+    @unittest.skipIf(not RUN_NVFUSER, "requires CUDA")
+    @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.PROFILING,
+                     "Requires fusion optimization pass to be effective")
+    @ops(op_db, allowed_dtypes=(torch.float16, torch.bfloat16, torch.float32,
+                                torch.float64, torch.complex64, torch.complex128))
+    def test_nvfuser_extremal_values(self, device, dtype, op):
+        variant_sample_pairs = get_traced_sample_variant_pairs(device, dtype, op)
+
+        def _get_extremal_tensor(x, val, dtype):
+            if x.dtype != dtype:
+                return x
+            return x.fill_(val)
+
+        def _get_extremal_input(x, val, dtype):
+            if isinstance(x, torch.Tensor):
+                return _get_extremal_tensor(x, val, dtype)
+            elif is_iterable_of_tensors(x):
+                return [_get_extremal_tensor(y, val, dtype) for y in x]
+            return x
+
+        def _get_extremal_sample(sample: SampleInput, val, dtype):
+            sample.input = _get_extremal_input(sample.input, val, dtype)
+            sample.args = [_get_extremal_input(x, val, dtype) for x in sample.args]
+            sample.kwargs = {k: _get_extremal_input(v, val, dtype) for k, v in sample.kwargs.items()}
+            return sample
+
+        def _get_extremal_samples(sample: SampleInput, dtype):
+            vals = [float('inf'), float('-inf'), float('nan')]
+            if dtype.is_complex:
+                complex_vals = itertools.product(vals, vals)
+                vals = list(map(lambda x: complex(*x), complex_vals))
+            for val in vals:
+                yield _get_extremal_sample(sample, val, dtype)
+
+        for variant, sample in variant_sample_pairs:
+            trace = create_traced_fn(self, variant)
+            trace(*clone_inputs((sample.input, *sample.args)), **sample.kwargs)
+            trace(*clone_inputs((sample.input, *sample.args)), **sample.kwargs)
+
+            for extremal_sample in _get_extremal_samples(sample, dtype):
+                ref = variant(*clone_inputs((extremal_sample.input, *extremal_sample.args)), **extremal_sample.kwargs)
+
+                val = trace(*clone_inputs((extremal_sample.input, *extremal_sample.args)), **extremal_sample.kwargs)
+
+                self.assertEqual(val, ref, equal_nan=True, exact_device=True)
 
 instantiate_device_type_tests(TestCudaFuserOpInfo, globals(), only_for=("cuda"))
 
